@@ -1,0 +1,16 @@
+# Derlenmiş dosyalar
+*.exe
+*.syso
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Veritabanı (kullanıcı verisi)
+*.db
