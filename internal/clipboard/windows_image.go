@@ -10,9 +10,16 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+)
+
+const (
+	// Clipboard retry settings
+	clipboardMaxRetries   = 10
+	clipboardRetryDelay   = 10 * time.Millisecond
 )
 
 var (
@@ -59,17 +66,28 @@ func ReadClipboardImage() (image.Image, error) {
 	return readClipboardImage()
 }
 
+// openClipboardWithRetry attempts to open the clipboard with retries
+func openClipboardWithRetry() error {
+	for i := 0; i < clipboardMaxRetries; i++ {
+		ret, _, _ := openClipboard.Call(0)
+		if ret != 0 {
+			return nil
+		}
+		time.Sleep(clipboardRetryDelay)
+	}
+	return fmt.Errorf("failed to open clipboard after %d retries", clipboardMaxRetries)
+}
+
 // readClipboardImage reads an image from Windows clipboard (internal)
 func readClipboardImage() (image.Image, error) {
-	// Open clipboard
-	ret, _, _ := openClipboard.Call(0)
-	if ret == 0 {
-		return nil, fmt.Errorf("failed to open clipboard")
+	// Open clipboard with retry
+	if err := openClipboardWithRetry(); err != nil {
+		return nil, err
 	}
 	defer closeClipboard.Call()
 
 	// Check if DIB format is available
-	ret, _, _ = isClipboardFormatAvailable.Call(CF_DIB)
+	ret, _, _ := isClipboardFormatAvailable.Call(CF_DIB)
 	if ret == 0 {
 		// Try DIBV5
 		ret, _, _ = isClipboardFormatAvailable.Call(CF_DIBV5)
@@ -209,15 +227,14 @@ func writeClipboardImage(img image.Image) error {
 		return fmt.Errorf("failed to convert image to DIB: %v", err)
 	}
 
-	// Open clipboard
-	ret, _, _ := openClipboard.Call(0)
-	if ret == 0 {
-		return fmt.Errorf("failed to open clipboard")
+	// Open clipboard with retry
+	if err := openClipboardWithRetry(); err != nil {
+		return err
 	}
 	defer closeClipboard.Call()
 
 	// Empty clipboard
-	ret, _, _ = emptyClipboard.Call()
+	ret, _, _ := emptyClipboard.Call()
 	if ret == 0 {
 		return fmt.Errorf("failed to empty clipboard")
 	}

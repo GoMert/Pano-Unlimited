@@ -22,6 +22,7 @@ type Monitor struct {
 	running       bool
 	mu            sync.Mutex
 	onChange      func(itemType string, content []byte)
+	onLimitWarn   func(remaining int)
 	pollInterval  time.Duration
 }
 
@@ -29,7 +30,7 @@ type Monitor struct {
 func NewMonitor(db *storage.Database) *Monitor {
 	return &Monitor{
 		db:           db,
-		pollInterval: 500 * time.Millisecond,
+		pollInterval: 200 * time.Millisecond, // Faster polling
 		running:      false,
 	}
 }
@@ -39,6 +40,13 @@ func (m *Monitor) SetOnChange(callback func(itemType string, content []byte)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.onChange = callback
+}
+
+// SetOnLimitWarn sets the callback for limit warnings
+func (m *Monitor) SetOnLimitWarn(callback func(remaining int)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onLimitWarn = callback
 }
 
 // Start begins monitoring the clipboard
@@ -68,15 +76,18 @@ func (m *Monitor) monitorLoop() {
 	defer ticker.Stop()
 
 	for {
-		m.mu.Lock()
-		if !m.running {
+		select {
+		case <-ticker.C:
+			m.mu.Lock()
+			running := m.running
 			m.mu.Unlock()
-			return
-		}
-		m.mu.Unlock()
 
-		m.checkClipboard()
-		<-ticker.C
+			if !running {
+				return
+			}
+
+			m.checkClipboard()
+		}
 	}
 }
 
@@ -110,18 +121,35 @@ func (m *Monitor) handleText(text string) {
 	m.lastTextHash = hash[:]
 
 	// Add to database
-	if err := m.db.AddItem("text", content); err != nil {
-		fmt.Printf("Error adding clipboard item: %v\n", err)
-		return
-	}
+	err := m.db.AddItem("text", content)
 
-	// Trigger callback
+	// Check for limit warnings
 	m.mu.Lock()
-	callback := m.onChange
+	limitCallback := m.onLimitWarn
+	changeCallback := m.onChange
 	m.mu.Unlock()
 
-	if callback != nil {
-		callback("text", content)
+	if err != nil {
+		errStr := err.Error()
+		if len(errStr) >= 10 && errStr[:10] == "LIMIT_FULL" {
+			if limitCallback != nil {
+				go limitCallback(0)
+			}
+			return
+		} else if len(errStr) >= 10 && errStr[:10] == "LIMIT_WARN" {
+			var remaining int
+			fmt.Sscanf(errStr, "LIMIT_WARN:%d", &remaining)
+			if limitCallback != nil {
+				go limitCallback(remaining)
+			}
+			// Continue to trigger onChange since item was added
+		} else {
+			return // Silently ignore other errors
+		}
+	}
+
+	if changeCallback != nil {
+		changeCallback("text", content)
 	}
 }
 
@@ -145,17 +173,33 @@ func (m *Monitor) handleImage(img image.Image) {
 	m.lastImageHash = hash[:]
 
 	// Add to database
-	if err := m.db.AddItem("image", content); err != nil {
-		fmt.Printf("Error adding clipboard item: %v\n", err)
-		return
-	}
+	err := m.db.AddItem("image", content)
 
-	// Trigger callback
+	// Check for limit warnings
 	m.mu.Lock()
-	callback := m.onChange
+	limitCallback := m.onLimitWarn
+	changeCallback := m.onChange
 	m.mu.Unlock()
 
-	if callback != nil {
-		callback("image", content)
+	if err != nil {
+		errStr := err.Error()
+		if len(errStr) >= 10 && errStr[:10] == "LIMIT_FULL" {
+			if limitCallback != nil {
+				go limitCallback(0)
+			}
+			return
+		} else if len(errStr) >= 10 && errStr[:10] == "LIMIT_WARN" {
+			var remaining int
+			fmt.Sscanf(errStr, "LIMIT_WARN:%d", &remaining)
+			if limitCallback != nil {
+				go limitCallback(remaining)
+			}
+		} else {
+			return // Silently ignore other errors
+		}
+	}
+
+	if changeCallback != nil {
+		changeCallback("image", content)
 	}
 }

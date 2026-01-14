@@ -2,6 +2,9 @@ package main
 
 import (
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/dialog"
@@ -54,8 +57,23 @@ func main() {
 		return
 	}
 
+	// Setup graceful shutdown handler
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Println("Shutting down gracefully...")
+		hotkeyMgr.Stop()
+		appUI.StopMonitoring()
+		os.Exit(0)
+	}()
+
 	// Run application - window starts hidden (background mode)
 	// User can show it with Alt+V or tray menu
 	// X button hides window instead of quitting (tray menu has Quit option)
 	appUI.Run()
+
+	// Cleanup on normal exit
+	hotkeyMgr.Stop()
+	appUI.StopMonitoring()
 }

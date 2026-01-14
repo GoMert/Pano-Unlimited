@@ -1,17 +1,19 @@
 package storage
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
 const (
-	MaxItems     = 100              // Maximum number of clipboard items
-	MaxItemSize  = 20 * 1024 * 1024 // 20MB per item
-	DatabaseFile = "clipboard.db"
+	DefaultMaxItems = 100              // Default maximum number of clipboard items
+	MaxItemSize     = 20 * 1024 * 1024 // 20MB per item
+	DatabaseFile    = "clipboard.db"
 )
 
 // ClipboardItem represents a single clipboard entry
@@ -22,12 +24,16 @@ type ClipboardItem struct {
 	Timestamp time.Time `json:"timestamp"`
 	Pinned    bool      `json:"pinned"`
 	Size      int       `json:"size"` // Original size in bytes
+	Hash      string    `json:"hash"` // Content hash for duplicate detection
 }
 
 // Database manages clipboard items storage
 type Database struct {
-	Items []ClipboardItem `json:"items"`
-	key   []byte          // Encryption key (not stored in JSON)
+	Items       []ClipboardItem     `json:"items"`
+	key         []byte              // Encryption key (not stored in JSON)
+	mu          sync.RWMutex        // Mutex for thread-safe operations
+	maxItems    int                 // Configurable max items limit
+	onLimitWarn func(remaining int) // Callback when near limit
 }
 
 // NewDatabase creates or loads the database
@@ -38,8 +44,9 @@ func NewDatabase() (*Database, error) {
 	}
 
 	db := &Database{
-		Items: make([]ClipboardItem, 0),
-		key:   key,
+		Items:    make([]ClipboardItem, 0),
+		key:      key,
+		maxItems: DefaultMaxItems,
 	}
 
 	// Try to load existing database
@@ -51,6 +58,67 @@ func NewDatabase() (*Database, error) {
 	}
 
 	return db, nil
+}
+
+// SetMaxItems sets the maximum number of items
+func (db *Database) SetMaxItems(max int) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if max < 10 {
+		max = 10
+	}
+	if max > 500 {
+		max = 500
+	}
+	db.maxItems = max
+	db.enforceLimit()
+	db.saveInternal()
+}
+
+// GetMaxItems returns the current maximum items limit
+func (db *Database) GetMaxItems() int {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.maxItems
+}
+
+// IsNearLimit returns true if item count is within 10 of the limit
+func (db *Database) IsNearLimit() bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return len(db.Items) >= db.maxItems-10
+}
+
+// GetRemainingSlots returns how many more items can be added
+func (db *Database) GetRemainingSlots() int {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	remaining := db.maxItems - len(db.Items)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+// SetOnLimitWarn sets callback for limit warning
+func (db *Database) SetOnLimitWarn(callback func(remaining int)) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.onLimitWarn = callback
+}
+
+// IsFull returns true if at or over limit
+func (db *Database) IsFull() bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	// Count unpinned items only (pinned don't count toward limit)
+	unpinnedCount := 0
+	for _, item := range db.Items {
+		if !item.Pinned {
+			unpinnedCount++
+		}
+	}
+	return unpinnedCount >= db.maxItems
 }
 
 // GetDatabasePath returns the full path to the database file
@@ -72,6 +140,9 @@ func GetDatabasePath() (string, error) {
 
 // Load loads the database from disk
 func (db *Database) Load() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	dbPath, err := GetDatabasePath()
 	if err != nil {
 		return err
@@ -96,8 +167,15 @@ func (db *Database) Load() error {
 	return nil
 }
 
-// Save saves the database to disk
+// Save saves the database to disk (thread-safe)
 func (db *Database) Save() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.saveInternal()
+}
+
+// saveInternal saves the database without locking (caller must hold lock)
+func (db *Database) saveInternal() error {
 	dbPath, err := GetDatabasePath()
 	if err != nil {
 		return err
@@ -125,10 +203,43 @@ func (db *Database) Save() error {
 
 // AddItem adds a new clipboard item
 func (db *Database) AddItem(itemType string, content []byte) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	// Check size limit
 	if len(content) > MaxItemSize {
 		return fmt.Errorf("item size (%d bytes) exceeds maximum (%d bytes)", len(content), MaxItemSize)
 	}
+
+	// Calculate content hash for duplicate detection
+	contentHash := fmt.Sprintf("%x", sha256.Sum256(content))
+
+	// Check for duplicate (same content already exists)
+	for i, existing := range db.Items {
+		if existing.Hash == contentHash && existing.Type == itemType {
+			// Move existing item to top instead of creating duplicate
+			db.Items = append([]ClipboardItem{existing}, append(db.Items[:i], db.Items[i+1:]...)...)
+			db.Items[0].Timestamp = time.Now()
+			return db.saveInternal()
+		}
+	}
+
+	// Count current unpinned items
+	unpinnedCount := 0
+	for _, item := range db.Items {
+		if !item.Pinned {
+			unpinnedCount++
+		}
+	}
+
+	// Check if we're at the limit - don't add new items if full
+	if unpinnedCount >= db.maxItems {
+		return fmt.Errorf("LIMIT_FULL:0")
+	}
+
+	// Calculate remaining slots for warning
+	remaining := db.maxItems - unpinnedCount - 1
+	warnNeeded := remaining <= 10 && remaining >= 0
 
 	// Encrypt content
 	encrypted, err := Encrypt(content, db.key)
@@ -144,21 +255,27 @@ func (db *Database) AddItem(itemType string, content []byte) error {
 		Timestamp: time.Now(),
 		Pinned:    false,
 		Size:      len(content),
+		Hash:      contentHash,
 	}
 
 	// Add to beginning of list
 	db.Items = append([]ClipboardItem{item}, db.Items...)
 
-	// Remove oldest unpinned items if we exceed the limit
-	db.enforceLimit()
-
 	// Save to disk
-	return db.Save()
+	if err := db.saveInternal(); err != nil {
+		return err
+	}
+
+	// Return warning signal if near limit
+	if warnNeeded {
+		return fmt.Errorf("LIMIT_WARN:%d", remaining)
+	}
+	return nil
 }
 
-// enforceLimit removes oldest unpinned items to stay within MaxItems
+// enforceLimit removes oldest unpinned items to stay within maxItems
 func (db *Database) enforceLimit() {
-	if len(db.Items) <= MaxItems {
+	if len(db.Items) <= db.maxItems {
 		return
 	}
 
@@ -174,16 +291,15 @@ func (db *Database) enforceLimit() {
 		}
 	}
 
-	// If pinned items exceed MaxItems, keep only the newest pinned items
-	// This shouldn't happen normally, but handle it as a safeguard
-	if len(pinnedItems) > MaxItems {
-		pinnedItems = pinnedItems[:MaxItems]
+	// If pinned items exceed maxItems, keep only the newest pinned items
+	if len(pinnedItems) > db.maxItems {
+		pinnedItems = pinnedItems[:db.maxItems]
 	}
 
 	// Calculate how many unpinned items we can keep
-	availableSlots := MaxItems - len(pinnedItems)
+	availableSlots := db.maxItems - len(pinnedItems)
 
-	// Keep the newest unpinned items (they are already in order from newest to oldest)
+	// Keep the newest unpinned items
 	if len(unpinnedItems) > availableSlots {
 		unpinnedItems = unpinnedItems[:availableSlots]
 	}
@@ -194,6 +310,9 @@ func (db *Database) enforceLimit() {
 
 // GetItem retrieves and decrypts an item by ID
 func (db *Database) GetItem(id string) (*ClipboardItem, []byte, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
 	for i, item := range db.Items {
 		if item.ID == id {
 			// Decrypt content
@@ -201,7 +320,9 @@ func (db *Database) GetItem(id string) (*ClipboardItem, []byte, error) {
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to decrypt item: %w", err)
 			}
-			return &db.Items[i], decrypted, nil
+			// Return a copy to avoid race conditions
+			itemCopy := db.Items[i]
+			return &itemCopy, decrypted, nil
 		}
 	}
 	return nil, nil, fmt.Errorf("item not found")
@@ -209,10 +330,13 @@ func (db *Database) GetItem(id string) (*ClipboardItem, []byte, error) {
 
 // TogglePin toggles the pinned status of an item
 func (db *Database) TogglePin(id string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	for i, item := range db.Items {
 		if item.ID == id {
 			db.Items[i].Pinned = !item.Pinned
-			return db.Save()
+			return db.saveInternal()
 		}
 	}
 	return fmt.Errorf("item not found")
@@ -220,33 +344,64 @@ func (db *Database) TogglePin(id string) error {
 
 // DeleteItem removes an item from the database
 func (db *Database) DeleteItem(id string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	for i, item := range db.Items {
 		if item.ID == id {
 			db.Items = append(db.Items[:i], db.Items[i+1:]...)
-			return db.Save()
+			return db.saveInternal()
 		}
 	}
 	return fmt.Errorf("item not found")
 }
 
 // GetAllItems returns all items (metadata only, no decrypted content)
+// Pinned items are returned first, then unpinned items by timestamp
 func (db *Database) GetAllItems() []ClipboardItem {
-	return db.Items
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	// Separate pinned and unpinned items
+	pinned := make([]ClipboardItem, 0)
+	unpinned := make([]ClipboardItem, 0)
+
+	for _, item := range db.Items {
+		if item.Pinned {
+			pinned = append(pinned, item)
+		} else {
+			unpinned = append(unpinned, item)
+		}
+	}
+
+	// Return pinned first, then unpinned
+	result := make([]ClipboardItem, 0, len(db.Items))
+	result = append(result, pinned...)
+	result = append(result, unpinned...)
+	return result
 }
 
 // ClearAll removes all items from the database
 func (db *Database) ClearAll() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	db.Items = make([]ClipboardItem, 0)
-	return db.Save()
+	return db.saveInternal()
 }
 
 // GetItemCount returns the number of items in the database
 func (db *Database) GetItemCount() int {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
 	return len(db.Items)
 }
 
 // GetPinnedCount returns the number of pinned items
 func (db *Database) GetPinnedCount() int {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
 	count := 0
 	for _, item := range db.Items {
 		if item.Pinned {

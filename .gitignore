@@ -14,3 +14,7 @@ Thumbs.db
 
 # Veritabanı (kullanıcı verisi)
 *.db
+
+# Geçici dosyalar
+*.py
+*.tmp

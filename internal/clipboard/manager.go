@@ -91,3 +91,33 @@ func (m *Manager) GetItemCount() int {
 func (m *Manager) GetPinnedCount() int {
 	return m.db.GetPinnedCount()
 }
+
+// SetMaxItems sets the maximum number of items
+func (m *Manager) SetMaxItems(max int) {
+	m.db.SetMaxItems(max)
+}
+
+// GetMaxItems returns the current maximum items limit
+func (m *Manager) GetMaxItems() int {
+	return m.db.GetMaxItems()
+}
+
+// IsNearLimit returns true if item count is within 10 of the limit
+func (m *Manager) IsNearLimit() bool {
+	return m.db.IsNearLimit()
+}
+
+// GetRemainingSlots returns how many more items can be added
+func (m *Manager) GetRemainingSlots() int {
+	return m.db.GetRemainingSlots()
+}
+
+// SetOnLimitWarn sets callback for limit warning
+func (m *Manager) SetOnLimitWarn(callback func(remaining int)) {
+	m.db.SetOnLimitWarn(callback)
+}
+
+// IsFull returns true if at or over limit
+func (m *Manager) IsFull() bool {
+	return m.db.IsFull()
+}

@@ -2,11 +2,13 @@ package ui
 
 import (
 	"fmt"
+	"sync"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"pano/internal/clipboard"
@@ -14,7 +16,6 @@ import (
 	"pano/internal/system"
 )
 
-// App represents the main application window
 type App struct {
 	fyneApp     fyne.App
 	window      fyne.Window
@@ -25,75 +26,74 @@ type App struct {
 	isVisible   bool
 	statusLabel *widget.Label
 	isDarkMode  bool
+	toastMu     sync.Mutex
 }
 
-// NewApp creates a new application
 func NewApp(fyneApp fyne.App, db *storage.Database, autostart *system.AutostartManager) *App {
 	app := &App{
 		fyneApp:   fyneApp,
 		manager:   clipboard.NewManager(db),
 		monitor:   clipboard.NewMonitor(db),
 		autostart: autostart,
+		isVisible: false,
 	}
 
-	// Load theme preference
-	app.isDarkMode = fyneApp.Preferences().BoolWithFallback("dark_mode", false)
-	
-	// Set theme based on preference
+	app.isDarkMode = fyneApp.Preferences().BoolWithFallback("dark_mode", true)
+
+	// Load saved max items limit
+	savedLimit := fyneApp.Preferences().IntWithFallback("max_items", 100)
+	app.manager.SetMaxItems(savedLimit)
+
 	if app.isDarkMode {
 		fyneApp.Settings().SetTheme(NewDarkTheme())
 	} else {
 		fyneApp.Settings().SetTheme(NewLightTheme())
 	}
 
-	// Create window
 	app.window = fyneApp.NewWindow("Pano")
-	app.window.Resize(fyne.NewSize(520, 700))
+	app.window.Resize(fyne.NewSize(380, 520))
 	app.window.CenterOnScreen()
 
-	// Create UI
 	app.buildUI()
 
-	// Hide instead of quit on close
 	app.window.SetCloseIntercept(func() {
 		app.Hide()
 	})
 
-	app.isVisible = false
+	// Set limit warning callback on monitor
+	app.monitor.SetOnLimitWarn(func(remaining int) {
+		if remaining == 0 {
+			app.sendNotification("Limit Doldu", "Pano limiti doldu! Yeni kopyalamalar kaydedilmiyor.")
+		} else {
+			app.sendNotification("Pano Uyarısı", fmt.Sprintf("Sadece %d alan kaldı! Yakında kopyaladıkların kaydedilmeyecek.", remaining))
+		}
+	})
 
-	// Set up clipboard monitor callback
 	app.monitor.SetOnChange(func(itemType string, content []byte) {
 		app.list.Refresh()
+		app.updateStatus()
 	})
 
 	return app
 }
 
-// buildUI constructs the user interface
+func (a *App) sendNotification(title, message string) {
+	notification := fyne.NewNotification(title, message)
+	a.fyneApp.SendNotification(notification)
+}
+
 func (a *App) buildUI() {
-	// Create clipboard list
 	a.list = NewClipboardList(a.manager)
 
-	// Set callbacks
 	a.list.SetCallbacks(
 		func(id string) {
-			defer func() {
-				if r := recover(); r != nil {
-					dialog.ShowError(fmt.Errorf("Kopyalama hatası: %v", r), a.window)
-				}
-			}()
 			if err := a.manager.CopyToClipboard(id); err != nil {
 				dialog.ShowError(err, a.window)
 			} else {
-				a.updateStatus()
+				a.showToast("Panoya kopyalandı")
 			}
 		},
 		func(id string) {
-			defer func() {
-				if r := recover(); r != nil {
-					dialog.ShowError(fmt.Errorf("Sabitleme hatası: %v", r), a.window)
-				}
-			}()
 			if err := a.manager.PinItem(id); err != nil {
 				dialog.ShowError(err, a.window)
 			} else {
@@ -102,11 +102,6 @@ func (a *App) buildUI() {
 			}
 		},
 		func(id string) {
-			defer func() {
-				if r := recover(); r != nil {
-					dialog.ShowError(fmt.Errorf("Silme hatası: %v", r), a.window)
-				}
-			}()
 			if err := a.manager.DeleteItem(id); err != nil {
 				dialog.ShowError(err, a.window)
 			} else {
@@ -116,72 +111,70 @@ func (a *App) buildUI() {
 		},
 	)
 
-	// Header
-	titleLabel := widget.NewLabel("Pano")
-	titleLabel.TextStyle = fyne.TextStyle{Bold: true}
+	titleLabel := widget.NewLabelWithStyle("Pano Geçmişi", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 
-	// Toolbar buttons
-	settingsBtn := widget.NewButton("Ayarlar", func() {
+	refreshBtn := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), func() {
+		a.list.Refresh()
+		a.updateStatus()
+		a.showToast("Yenilendi")
+	})
+
+	settingsBtn := widget.NewButtonWithIcon("", theme.SettingsIcon(), func() {
 		a.showSettingsDialog()
 	})
 
-	refreshBtn := widget.NewButton("Yenile", func() {
-		a.list.Refresh()
-		a.updateStatus()
-	})
-
-	clearAllBtn := widget.NewButton("Tümünü Sil", func() {
+	clearBtn := widget.NewButtonWithIcon("Temizle", theme.DeleteIcon(), func() {
 		a.showClearAllDialog()
 	})
-	clearAllBtn.Importance = widget.DangerImportance
+	clearBtn.Importance = widget.DangerImportance
 
-	// Toolbar layout
-	toolbar := container.NewHBox(
-		settingsBtn,
-		refreshBtn,
-		layout.NewSpacer(),
-		clearAllBtn,
-	)
+	header := container.NewBorder(nil, nil, titleLabel, container.NewHBox(refreshBtn, settingsBtn, clearBtn))
 
-	// Status bar
 	a.statusLabel = widget.NewLabel("")
 	a.updateStatus()
 
-	shortcutLabel := widget.NewLabel("Ctrl+Shift+V")
+	shortcutLabel := widget.NewLabelWithStyle("Ctrl+Shift+V", fyne.TextAlignTrailing, fyne.TextStyle{Italic: true})
 
-	// Header section
-	header := container.NewVBox(
-		container.NewBorder(nil, nil, titleLabel, nil),
-		toolbar,
-		widget.NewSeparator(),
-	)
+	footer := container.NewBorder(nil, nil, a.statusLabel, shortcutLabel)
 
-	// Footer section
-	footer := container.NewVBox(
-		widget.NewSeparator(),
-		container.NewBorder(nil, nil, a.statusLabel, shortcutLabel),
-	)
+	scroll := container.NewVScroll(a.list)
 
-	// Main layout
 	content := container.NewBorder(
-		header,
-		footer,
-		nil,
-		nil,
-		container.NewScroll(a.list),
+		container.NewVBox(header, widget.NewSeparator()),
+		container.NewVBox(widget.NewSeparator(), footer),
+		nil, nil,
+		scroll,
 	)
 
-	a.window.SetContent(content)
+	a.window.SetContent(container.NewPadded(content))
 }
 
-// updateStatus updates the status bar
+func (a *App) showToast(message string) {
+	a.toastMu.Lock()
+	defer a.toastMu.Unlock()
+	
+	a.statusLabel.SetText("[OK] " + message)
+	go func() {
+		time.Sleep(1500 * time.Millisecond)
+		a.toastMu.Lock()
+		a.updateStatusInternal()
+		a.toastMu.Unlock()
+	}()
+}
+
 func (a *App) updateStatus() {
-	total := a.manager.GetItemCount()
-	pinned := a.manager.GetPinnedCount()
-	a.statusLabel.SetText(fmt.Sprintf("%d öğe  •  %d sabit", total, pinned))
+	a.toastMu.Lock()
+	defer a.toastMu.Unlock()
+	a.updateStatusInternal()
 }
 
-// showSettingsDialog shows settings dialog
+func (a *App) updateStatusInternal() {
+	total := a.manager.GetItemCount()
+	maxItems := a.manager.GetMaxItems()
+	pinned := a.manager.GetPinnedCount()
+	a.statusLabel.SetText(fmt.Sprintf("%d/%d öğe - %d sabit", total, maxItems, pinned))
+}
+
 func (a *App) showSettingsDialog() {
 	isEnabled, err := a.autostart.IsEnabled()
 	if err != nil {
@@ -189,200 +182,115 @@ func (a *App) showSettingsDialog() {
 		return
 	}
 
-	// Status text
-	statusText := "Kapalı"
-	if isEnabled {
-		statusText = "Açık"
-	}
-
-	// Title
-	titleLabel := widget.NewLabel("Ayarlar")
-	titleLabel.TextStyle = fyne.TextStyle{Bold: true}
-
-	// Theme section
-	themeTitle := widget.NewLabel("Tema")
-	themeTitle.TextStyle = fyne.TextStyle{Bold: true}
-
-	themeStatus := widget.NewLabel("Durum: Açık Tema")
-	if a.isDarkMode {
-		themeStatus.SetText("Durum: Koyu Tema")
-	}
-
-	var themeBtn *widget.Button
-	themeBtn = widget.NewButton("", nil)
-
-	updateThemeUI := func() {
-		if a.isDarkMode {
-			themeStatus.SetText("Durum: Koyu Tema")
-			themeBtn.SetText("Açık Tema")
-		} else {
-			themeStatus.SetText("Durum: Açık Tema")
-			themeBtn.SetText("Koyu Tema")
-		}
-		themeBtn.Refresh()
-	}
-
-	if a.isDarkMode {
-		themeBtn.SetText("Açık Tema")
-	} else {
-		themeBtn.SetText("Koyu Tema")
-	}
-
-	themeBtn.OnTapped = func() {
-		a.isDarkMode = !a.isDarkMode
-		a.fyneApp.Preferences().SetBool("dark_mode", a.isDarkMode)
-		
-		if a.isDarkMode {
+	// Theme selection
+	themeLabel := widget.NewLabelWithStyle("Tema", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	themeSelect := widget.NewSelect([]string{"Koyu Tema", "Açık Tema"}, func(s string) {
+		if s == "Koyu Tema" {
+			a.isDarkMode = true
 			a.fyneApp.Settings().SetTheme(NewDarkTheme())
 		} else {
+			a.isDarkMode = false
 			a.fyneApp.Settings().SetTheme(NewLightTheme())
 		}
-		
-		updateThemeUI()
+		a.fyneApp.Preferences().SetBool("dark_mode", a.isDarkMode)
 		a.list.Refresh()
-	}
-
-	// Autostart section
-	autostartTitle := widget.NewLabel("Başlangıç Ayarları")
-	autostartTitle.TextStyle = fyne.TextStyle{Bold: true}
-
-	autostartStatus := widget.NewLabel(fmt.Sprintf("Durum: %s", statusText))
-
-	var autostartBtn *widget.Button
-	autostartBtn = widget.NewButton("", nil)
-
-	updateAutostartUI := func() {
-		enabled, _ := a.autostart.IsEnabled()
-		if enabled {
-			autostartStatus.SetText("Durum: Açık")
-			autostartBtn.SetText("Kapat")
-			autostartBtn.Importance = widget.WarningImportance
-		} else {
-			autostartStatus.SetText("Durum: Kapalı")
-			autostartBtn.SetText("Aç")
-			autostartBtn.Importance = widget.HighImportance
-		}
-		autostartBtn.Refresh()
-	}
-
-	if isEnabled {
-		autostartBtn.SetText("Kapat")
-		autostartBtn.Importance = widget.WarningImportance
+	})
+	if a.isDarkMode {
+		themeSelect.SetSelected("Koyu Tema")
 	} else {
-		autostartBtn.SetText("Aç")
-		autostartBtn.Importance = widget.HighImportance
+		themeSelect.SetSelected("Açık Tema")
 	}
 
-	autostartBtn.OnTapped = func() {
-		currentEnabled, _ := a.autostart.IsEnabled()
-		if currentEnabled {
-			dialog.ShowConfirm(
-				"Uyarı",
-				"Başlangıçta çalıştırmayı kapatmak istediğinizden emin misiniz?",
-				func(confirm bool) {
-					if confirm {
-						if err := a.autostart.Disable(); err != nil {
-							dialog.ShowError(err, a.window)
-						} else {
-							updateAutostartUI()
-							dialog.ShowInformation("Başarılı", "Başlangıçta çalıştırma kapatıldı.", a.window)
-						}
-					}
-				},
-				a.window,
-			)
-		} else {
+	// Max items limit
+	limitLabel := widget.NewLabelWithStyle("Maksimum Öğe Sayısı", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	currentLimit := a.manager.GetMaxItems()
+	limitValue := widget.NewLabel(fmt.Sprintf("%d öğe", currentLimit))
+	
+	limitSlider := widget.NewSlider(10, 500)
+	limitSlider.Step = 10
+	limitSlider.Value = float64(currentLimit)
+	limitSlider.OnChanged = func(v float64) {
+		limitValue.SetText(fmt.Sprintf("%d öğe", int(v)))
+	}
+	limitSlider.OnChangeEnded = func(v float64) {
+		newLimit := int(v)
+		a.manager.SetMaxItems(newLimit)
+		a.fyneApp.Preferences().SetInt("max_items", newLimit)
+		a.updateStatus()
+	}
+
+	// Autostart
+	autostartLabel := widget.NewLabelWithStyle("Başlangıç", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	autostartCheck := widget.NewCheck("Windows ile başlat", func(checked bool) {
+		if checked {
 			if err := a.autostart.Enable(); err != nil {
 				dialog.ShowError(err, a.window)
-			} else {
-				updateAutostartUI()
-				dialog.ShowInformation("Başarılı", "Başlangıçta çalıştırma açıldı.", a.window)
+			}
+		} else {
+			if err := a.autostart.Disable(); err != nil {
+				dialog.ShowError(err, a.window)
 			}
 		}
-	}
+	})
+	autostartCheck.Checked = isEnabled
 
-	// Info section
-	infoTitle := widget.NewLabel("Bilgi")
-	infoTitle.TextStyle = fyne.TextStyle{Bold: true}
+	// Info
+	infoLabel := widget.NewLabelWithStyle("Hakkında", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	infoText := widget.NewLabel("Kısayol: Ctrl+Shift+V\nŞifreleme: AES-256")
 
-	infoText := widget.NewLabel(
-		"Kısayol: Ctrl+Shift+V\n" +
-			"Maksimum: 100 öğe\n" +
-			"Veriler şifrelenmiş olarak saklanır")
-	infoText.Wrapping = fyne.TextWrapWord
-
-	content := container.NewVBox(
-		titleLabel,
+	dialogContent := container.NewVBox(
+		themeLabel,
+		themeSelect,
 		widget.NewSeparator(),
-		themeTitle,
-		themeStatus,
-		themeBtn,
+		limitLabel,
+		container.NewBorder(nil, nil, nil, limitValue, limitSlider),
 		widget.NewSeparator(),
-		autostartTitle,
-		autostartStatus,
-		autostartBtn,
+		autostartLabel,
+		autostartCheck,
 		widget.NewSeparator(),
-		infoTitle,
+		infoLabel,
 		infoText,
 	)
 
-	dialog.ShowCustom("Ayarlar", "Kapat", content, a.window)
+	dialog.ShowCustom("Ayarlar", "Kapat", dialogContent, a.window)
 }
 
-// showClearAllDialog shows confirmation dialog for clearing all items
 func (a *App) showClearAllDialog() {
-	itemCount := a.manager.GetItemCount()
-	pinnedCount := a.manager.GetPinnedCount()
-
-	if itemCount == 0 {
+	count := a.manager.GetItemCount()
+	if count == 0 {
 		dialog.ShowInformation("Bilgi", "Silinecek öğe yok.", a.window)
 		return
 	}
 
-	dialog.ShowConfirm(
-		"Tümünü Sil",
-		fmt.Sprintf("%d öğe silinecek.\n(%d tanesi sabitlenmiş)\n\nDevam edilsin mi?", itemCount, pinnedCount),
-		func(firstConfirm bool) {
-			if firstConfirm {
-				dialog.ShowConfirm(
-					"Son Onay",
-					"Bu işlem geri alınamaz.\n\nEmin misiniz?",
-					func(secondConfirm bool) {
-						if secondConfirm {
-							if err := a.manager.ClearAll(); err != nil {
-								dialog.ShowError(err, a.window)
-							} else {
-								a.list.Refresh()
-								a.updateStatus()
-								dialog.ShowInformation("Başarılı", "Tüm öğeler silindi.", a.window)
-							}
-						}
-					},
-					a.window,
-				)
+	dialog.ShowConfirm("Tümünü Temizle",
+		fmt.Sprintf("%d öğe silinecek. Devam edilsin mi?", count),
+		func(ok bool) {
+			if ok {
+				if err := a.manager.ClearAll(); err != nil {
+					dialog.ShowError(err, a.window)
+				} else {
+					thumbCache.clear()
+					a.list.Refresh()
+					a.updateStatus()
+				}
 			}
-		},
-		a.window,
-	)
+		}, a.window)
 }
 
-// Show displays the window
 func (a *App) Show() {
+	a.isVisible = true
 	a.list.Refresh()
 	a.updateStatus()
 	a.window.Show()
 	a.window.RequestFocus()
 	BringWindowToFront("Pano")
-	a.isVisible = true
 }
 
-// Hide hides the window
 func (a *App) Hide() {
-	a.window.Hide()
 	a.isVisible = false
+	a.window.Hide()
 }
 
-// Toggle toggles window visibility
 func (a *App) Toggle() {
 	if a.isVisible {
 		a.Hide()
@@ -391,23 +299,23 @@ func (a *App) Toggle() {
 	}
 }
 
-// StartMonitoring starts clipboard monitoring
 func (a *App) StartMonitoring() error {
 	return a.monitor.Start()
 }
 
-// Run runs the application
+func (a *App) StopMonitoring() {
+	a.monitor.Stop()
+}
+
 func (a *App) Run() {
-	a.isVisible = false
+	a.isVisible = true
 	a.window.ShowAndRun()
 }
 
-// GetWindow returns the application window
 func (a *App) GetWindow() fyne.Window {
 	return a.window
 }
 
-// GetFyneApp returns the Fyne application instance
 func (a *App) GetFyneApp() fyne.App {
 	return a.fyneApp
 }

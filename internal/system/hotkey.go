@@ -7,6 +7,27 @@ import (
 	hook "github.com/robotn/gohook"
 )
 
+// Key codes for Windows
+const (
+	// Ctrl key codes (scan codes and virtual key codes)
+	scCtrlLeft   = 29
+	scCtrlRight  = 3613
+	vkCtrlLeft   = 162
+	vkCtrlRight  = 163
+	vkCtrl       = 17
+
+	// Shift key codes (scan codes and virtual key codes)
+	scShiftLeft  = 42
+	scShiftRight = 54
+	vkShiftLeft  = 160
+	vkShiftRight = 161
+	vkShift      = 16
+
+	// V key codes
+	scV = 47
+	vkV = 86
+)
+
 // HotkeyManager handles global hotkey registration
 type HotkeyManager struct {
 	callback func()
@@ -50,6 +71,23 @@ func (h *HotkeyManager) Stop() {
 	hook.End()
 }
 
+// isCtrlKey checks if the rawcode is a Ctrl key
+func isCtrlKey(rawcode uint16) bool {
+	return rawcode == scCtrlLeft || rawcode == scCtrlRight ||
+		rawcode == vkCtrlLeft || rawcode == vkCtrlRight || rawcode == vkCtrl
+}
+
+// isShiftKey checks if the rawcode is a Shift key
+func isShiftKey(rawcode uint16) bool {
+	return rawcode == scShiftLeft || rawcode == scShiftRight ||
+		rawcode == vkShiftLeft || rawcode == vkShiftRight || rawcode == vkShift
+}
+
+// isVKey checks if the rawcode is the V key
+func isVKey(rawcode uint16) bool {
+	return rawcode == scV || rawcode == vkV
+}
+
 // listenForHotkey listens for Ctrl+Shift+V combination
 func (h *HotkeyManager) listenForHotkey() {
 	// Modifier key state tracking
@@ -71,16 +109,16 @@ func (h *HotkeyManager) listenForHotkey() {
 		}
 
 		if ev.Kind == hook.KeyDown {
-			// Track Ctrl key (scan codes: 29 left, 3613 right OR virtual key codes: 162 left, 163 right)
-			if ev.Rawcode == 29 || ev.Rawcode == 3613 || ev.Rawcode == 162 || ev.Rawcode == 163 || ev.Rawcode == 17 {
+			// Track Ctrl key
+			if isCtrlKey(ev.Rawcode) {
 				ctrlPressed = true
 			}
-			// Track Shift key (scan codes: 42 left, 54 right OR virtual key codes: 160 left, 161 right)
-			if ev.Rawcode == 42 || ev.Rawcode == 54 || ev.Rawcode == 160 || ev.Rawcode == 161 || ev.Rawcode == 16 {
+			// Track Shift key
+			if isShiftKey(ev.Rawcode) {
 				shiftPressed = true
 			}
-			// Check for V key (scan code: 47, virtual key: 86)
-			if (ev.Rawcode == 47 || ev.Rawcode == 86) && ctrlPressed && shiftPressed {
+			// Check for V key with modifiers
+			if isVKey(ev.Rawcode) && ctrlPressed && shiftPressed {
 				// Ctrl+Shift+V detected - trigger callback
 				h.mu.Lock()
 				callback := h.callback
@@ -92,11 +130,11 @@ func (h *HotkeyManager) listenForHotkey() {
 			}
 		} else if ev.Kind == hook.KeyUp {
 			// Reset Ctrl state when Ctrl key is released
-			if ev.Rawcode == 29 || ev.Rawcode == 3613 || ev.Rawcode == 162 || ev.Rawcode == 163 || ev.Rawcode == 17 {
+			if isCtrlKey(ev.Rawcode) {
 				ctrlPressed = false
 			}
 			// Reset Shift state when Shift key is released
-			if ev.Rawcode == 42 || ev.Rawcode == 54 || ev.Rawcode == 160 || ev.Rawcode == 161 || ev.Rawcode == 16 {
+			if isShiftKey(ev.Rawcode) {
 				shiftPressed = false
 			}
 		}
